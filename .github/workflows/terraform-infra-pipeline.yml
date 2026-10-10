@@ -1,36 +1,146 @@
-# This is a basic workflow to help you get started with Actions
+name : Terraform dev 
+trigger:
+  - main
 
-name: CI
+pool:
+  name: Default  # Self-hosted agent pool
 
-# Controls when the workflow will run
-on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+variables:
+  azureServiceConnection: 'azure-service-connection'
+  terraformVersion: '1.9.8'
+  workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+stages:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+# Stage 1: Terraform Validation
+- stage: Validate
+  displayName: 'Terraform Validate'
+  jobs:
+  - job: ValidateJob
+    displayName: 'Format, Init and Validate'
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+    - checkout: self
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+    - script: terraform fmt -check -recursive
+      displayName: 'Terraform Format Check'
+      workingDirectory: '$(workingDirectory)'
+
+    - task: TerraformTask@5
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(workingDirectory)'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'tfstate-rg'
+        backendAzureRmStorageAccountName: 'tfstatestorage001'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'prod.terraform.tfstate'
+
+    - script: terraform validate
+      displayName: 'Terraform Validate'
+      workingDirectory: '$(workingDirectory)'
+
+# Stage 2: Security Scan
+- stage: SecurityScan
+  displayName: 'Terraform Security Scan'
+  dependsOn: Validate
+  jobs:
+  - job: SecurityJob
+    displayName: 'Run Checkov'
+    steps:
+    - checkout: self
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install checkov
+        checkov -d . --framework terraform
+      displayName: 'Checkov Security Scan'
+      workingDirectory: '$(workingDirectory)'
+
+# Stage 3: Terraform Plan
+- stage: Plan
+  displayName: 'Terraform Plan'
+  dependsOn: SecurityScan
+  jobs:
+  - job: PlanJob
+    displayName: 'Generate Execution Plan'
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - task: TerraformTask@5
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(workingDirectory)'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'tfstate-rg'
+        backendAzureRmStorageAccountName: 'tfstatestorage001'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'prod.terraform.tfstate'
+
+    - task: TerraformTask@5
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(workingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-out=tfplan'
+
+    - publish: '$(workingDirectory)/tfplan'
+      artifact: terraform-plan
+      displayName: 'Publish Terraform Plan'
+
+# Stage 4: Terraform Apply
+- stage: Apply
+  displayName: 'Terraform Apply'
+  dependsOn: Plan
+  condition: succeeded()
+  jobs:
+  - deployment: ApplyJob
+    displayName: 'Apply Infrastructure Changes'
+    environment: 'terraform-production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+
+          - task: TerraformTask@5
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: 'tfstate-rg'
+              backendAzureRmStorageAccountName: 'tfstatestorage001'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'prod.terraform.tfstate'
+
+          - download: current
+            artifact: terraform-plan
+
+          - task: TerraformTask@5
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(workingDirectory)'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+              commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplan'
