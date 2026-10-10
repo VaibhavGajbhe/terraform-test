@@ -1,6 +1,8 @@
 name : Terraform dev 
-trigger:
-  - main
+
+on : 
+  workflow_dispatch:
+  
 
 pool:
   name: Default  # Self-hosted agent pool
