@@ -1,7 +1,7 @@
 name : Terraform dev 
 
 on : 
-  workflow_dispatch:
+  workflow_dispatch
   
 
 pool:
